@@ -1,7 +1,8 @@
 ﻿using Newtonsoft.Json;
+using Rocket.API;
+using Rocket.Core;
 using Rocket.Core.Logging;
 using Rocket.Core.Plugins;
-using Rocket.Unturned.Player;
 using SDG.Unturned;
 using Steamworks;
 using System;
@@ -17,10 +18,17 @@ namespace DonateFly
         public static Plugin Instance { get; private set; }
         private bool _isEnabled = false;
 
+        private string _assemblyName;
+        private string _assemblyVersion;
+
         protected override void Load()
         {
             Instance = this;
             _isEnabled = true;
+
+            _assemblyName = GetType().Assembly.GetName().Name;
+            _assemblyVersion = GetType().Assembly.GetName().Version.ToString();
+
             ValidateConfiguration();
             SendRequest();
             StartRequestLoop();
@@ -47,7 +55,7 @@ namespace DonateFly
             while (_isEnabled)
             {
                 await Task.Delay(Configuration.Instance.RequestFrequency * 60 * 1000);
-                SendRequest();
+                if (_isEnabled) SendRequest();
             }
         }
 
@@ -55,6 +63,12 @@ namespace DonateFly
         {
             try
             {
+                if (Configuration.Instance == null)
+                {
+                    Logger.LogError("Configuration instance is null.");
+                    return;
+                }
+
                 var requestData = new
                 {
                     server_id = Configuration.Instance.ServerID,
@@ -65,61 +79,116 @@ namespace DonateFly
                 var json = JsonConvert.SerializeObject(requestData);
                 Logger.Log($"Request JSON: {json}");
 
-                var request = WebRequest.CreateHttp("https://donatefly.shop/plugin/notifications/");
+                var request = (HttpWebRequest)WebRequest.Create("https://donatefly.shop/plugin/notifications/");
                 request.Method = "POST";
                 request.ContentType = "application/json";
+                request.UserAgent = $"{_assemblyName}/{_assemblyVersion}";
+                request.Timeout = 10000;
 
                 using (var streamWriter = new StreamWriter(request.GetRequestStream()))
                 {
                     streamWriter.Write(json);
                 }
 
-                var response = request.GetResponse() as HttpWebResponse;
-                if (response != null && response.StatusCode == HttpStatusCode.OK)
+                using (var response = request.GetResponse() as HttpWebResponse)
                 {
-                    using (var streamReader = new StreamReader(response.GetResponseStream()))
+                    if (response != null && response.StatusCode == HttpStatusCode.OK)
                     {
-                        var result = JsonConvert.DeserializeObject<List<Purchase>>(streamReader.ReadToEnd());
-                        foreach (var purchase in result)
+                        Logger.Log("Received response from DonateFly.");
+
+                        var result = GetPurchasesFromResponse(response);
+                        if (result != null)
                         {
-                            Logger.Log($"Processing purchase {purchase.Id} for SteamID {purchase.SteamId}: Command - {purchase.Command}");
-                            var player = UnturnedPlayer.FromCSteamID(new CSteamID(ulong.Parse(purchase.SteamId)));
-                            if (player != null)
-                            {
-                                Commander.execute(player.CSteamID, purchase.Command);
-                            }
-                            else
-                            {
-                                Logger.LogWarning($"Player with SteamID {purchase.SteamId} not found. Command not executed.");
-                            }
+                            ProcessPurchases(result);
+                        }
+                        else
+                        {
+                            Logger.LogWarning("Received null or empty response from DonateFly.");
                         }
                     }
-                }
-                else
-                {
-                    Logger.LogError($"Unexpected response from DonateFly: {response?.StatusCode}");
+                    else
+                    {
+                        Logger.LogError($"Unexpected response from DonateFly: {response?.StatusCode}");
+                    }
                 }
             }
             catch (WebException webEx)
             {
+                Logger.LogError($"DonateFly API Error: {webEx.Status} - {webEx.Message}");
+
                 if (webEx.Response is HttpWebResponse errorResponse)
                 {
-                    Logger.LogError($"DonateFly API Error: {errorResponse.StatusCode} - {errorResponse.StatusDescription}");
                     using (var reader = new StreamReader(errorResponse.GetResponseStream()))
                     {
                         string errorBody = reader.ReadToEnd();
                         Logger.LogError($"Error Details: {errorBody}");
                     }
                 }
-                else
-                {
-                    Logger.LogError($"Network Error: {webEx.Message}");
-                }
             }
             catch (Exception ex)
             {
-                Logger.LogError($"Error sending request: {ex.Message}");
+                Logger.LogException(ex, "An error occurred while processing a DonateFly purchase.");
             }
+        }
+
+        private List<Purchase> GetPurchasesFromResponse(HttpWebResponse response)
+        {
+            using (var streamReader = new StreamReader(response.GetResponseStream()))
+            {
+                var responseText = streamReader.ReadToEnd();
+                Logger.Log($"Response JSON: {responseText}");
+                return JsonConvert.DeserializeObject<List<Purchase>>(responseText);
+            }
+        }
+
+        private void ProcessPurchases(List<Purchase> purchases)
+        {
+            foreach (var purchase in purchases)
+            {
+                if (!IsValidPurchase(purchase))
+                {
+                    Logger.LogWarning($"Invalid purchase data received: {JsonConvert.SerializeObject(purchase)}");
+                    continue;
+                }
+
+                try
+                {
+                    var steamId = new CSteamID(ulong.Parse(purchase.SteamId));
+                    Logger.Log($"Processing purchase {purchase.Id} for SteamID {steamId}: Command - {purchase.Command}");
+
+                    string formattedCommand = string.Format(purchase.Command, steamId);
+                    Logger.Log($"Executing command from console: {formattedCommand}");
+
+                    bool executed = ExecuteCommand(formattedCommand);
+                    if (!executed)
+                    {
+                        Logger.LogError($"Failed to execute command for purchase {purchase.Id}");
+                    }
+                }
+                catch (FormatException ex)
+                {
+                    Logger.LogError($"Error parsing SteamID in purchase {purchase.Id}: {ex.Message}");
+                }
+                catch (Exception ex)
+                {
+                    Logger.LogError($"Error processing purchase {purchase.Id}: {ex.Message}");
+                }
+            }
+        }
+
+        private bool IsValidPurchase(Purchase purchase) =>
+            purchase.Id > 0 &&
+            !string.IsNullOrEmpty(purchase.SteamId) &&
+            !string.IsNullOrEmpty(purchase.Command);
+
+
+        private bool ExecuteCommand(string command)
+        {
+            bool executedByRocket = R.Commands.Execute(new ConsolePlayer(), command);
+            if (executedByRocket) return true;
+
+            bool executedByCommander = Commander.execute(new CSteamID(0), command);
+            return executedByCommander;
         }
 
         public class Purchase
