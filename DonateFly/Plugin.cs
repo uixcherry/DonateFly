@@ -21,6 +21,9 @@ namespace DonateFly
         private string _assemblyName;
         private string _assemblyVersion;
 
+        private int _failedRequestCount = 0;
+        private const int MaxFailedRequests = 3;
+
         protected override void Load()
         {
             Instance = this;
@@ -69,11 +72,16 @@ namespace DonateFly
                     return;
                 }
 
+                var players = GetOnlinePlayers();
+                var maxPlayers = GetMaxPlayers();
+
                 var requestData = new
                 {
                     server_id = Configuration.Instance.ServerID,
                     server_key = Configuration.Instance.ServerKey,
-                    request_frequency = Configuration.Instance.RequestFrequency
+                    request_frequency = Configuration.Instance.RequestFrequency,
+                    players = players,
+                    max_players = maxPlayers
                 };
 
                 var json = JsonConvert.SerializeObject(requestData);
@@ -95,7 +103,7 @@ namespace DonateFly
                     if (response != null && response.StatusCode == HttpStatusCode.OK)
                     {
                         Logger.Log("Received response from DonateFly.");
-
+                        _failedRequestCount = 0;
                         var result = GetPurchasesFromResponse(response);
                         if (result != null)
                         {
@@ -109,12 +117,14 @@ namespace DonateFly
                     else
                     {
                         Logger.LogError($"Unexpected response from DonateFly: {response?.StatusCode}");
+                        HandleFailedRequest();
                     }
                 }
             }
             catch (WebException webEx)
             {
                 Logger.LogError($"DonateFly API Error: {webEx.Status} - {webEx.Message}");
+                HandleFailedRequest();
 
                 if (webEx.Response is HttpWebResponse errorResponse)
                 {
@@ -128,7 +138,32 @@ namespace DonateFly
             catch (Exception ex)
             {
                 Logger.LogException(ex, "An error occurred while processing a DonateFly purchase.");
+                HandleFailedRequest();
             }
+        }
+
+        private void HandleFailedRequest()
+        {
+            _failedRequestCount++;
+            if (_failedRequestCount >= MaxFailedRequests)
+            {
+                Logger.LogError("Server is considered stopped due to multiple failed requests.");
+            }
+        }
+
+        private List<string> GetOnlinePlayers()
+        {
+            List<string> playerList = new List<string>();
+            foreach (var player in Provider.clients)
+            {
+                playerList.Add(player.playerID.steamID.ToString());
+            }
+            return playerList;
+        }
+
+        private int GetMaxPlayers()
+        {
+            return Provider.maxPlayers;
         }
 
         private List<Purchase> GetPurchasesFromResponse(HttpWebResponse response)
@@ -184,6 +219,12 @@ namespace DonateFly
 
         private bool ExecuteCommand(string command)
         {
+            if (string.IsNullOrEmpty(command))
+            {
+                Logger.LogError("Command is null or empty.");
+                return false;
+            }
+
             bool executedByRocket = R.Commands.Execute(new ConsolePlayer(), command);
             if (executedByRocket) return true;
 
