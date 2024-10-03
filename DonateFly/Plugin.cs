@@ -7,8 +7,8 @@ using SDG.Unturned;
 using Steamworks;
 using System;
 using System.Collections.Generic;
-using System.IO;
-using System.Net;
+using System.Net.Http;
+using System.Threading;
 using System.Threading.Tasks;
 
 namespace DonateFly
@@ -23,6 +23,8 @@ namespace DonateFly
 
         private int _failedRequestCount = 0;
         private const int MaxFailedRequests = 3;
+        private readonly HttpClient _httpClient = new HttpClient();
+        private CancellationTokenSource _cancellationTokenSource;
 
         protected override void Load()
         {
@@ -33,14 +35,16 @@ namespace DonateFly
             _assemblyVersion = GetType().Assembly.GetName().Version.ToString();
 
             ValidateConfiguration();
-            SendRequest();
-            StartRequestLoop();
+
+            _cancellationTokenSource = new CancellationTokenSource();
+            _ = StartRequestLoop(_cancellationTokenSource.Token);
         }
 
         protected override void Unload()
         {
             Instance = null;
             _isEnabled = false;
+            _cancellationTokenSource.Cancel();
         }
 
         private void ValidateConfiguration()
@@ -53,25 +57,26 @@ namespace DonateFly
             }
         }
 
-        private async void StartRequestLoop()
+        private async Task StartRequestLoop(CancellationToken cancellationToken)
         {
             while (_isEnabled)
             {
-                await Task.Delay(Configuration.Instance.RequestFrequency * 60 * 1000);
-                if (_isEnabled) SendRequest();
+                try
+                {
+                    await Task.Delay(Configuration.Instance.RequestFrequency * 60 * 1000, cancellationToken);
+                    if (_isEnabled) await SendRequestAsync();
+                }
+                catch (TaskCanceledException)
+                {
+                    Logger.Log("Request loop canceled.");
+                }
             }
         }
 
-        private void SendRequest()
+        private async Task SendRequestAsync()
         {
             try
             {
-                if (Configuration.Instance == null)
-                {
-                    Logger.LogError("Configuration instance is null.");
-                    return;
-                }
-
                 var players = GetOnlinePlayers();
                 var maxPlayers = GetMaxPlayers();
 
@@ -87,53 +92,34 @@ namespace DonateFly
                 var json = JsonConvert.SerializeObject(requestData);
                 Logger.Log($"Request JSON: {json}");
 
-                var request = (HttpWebRequest)WebRequest.Create("https://donatefly.shop/plugin/notifications/");
-                request.Method = "POST";
-                request.ContentType = "application/json";
-                request.UserAgent = $"{_assemblyName}/{_assemblyVersion}";
-                request.Timeout = 10000;
+                var requestContent = new StringContent(json, System.Text.Encoding.UTF8, "application/json");
 
-                using (var streamWriter = new StreamWriter(request.GetRequestStream()))
-                {
-                    streamWriter.Write(json);
-                }
+                var response = await _httpClient.PostAsync("https://donatefly.shop/plugin/notifications/", requestContent);
 
-                using (var response = request.GetResponse() as HttpWebResponse)
+                if (response.IsSuccessStatusCode)
                 {
-                    if (response != null && response.StatusCode == HttpStatusCode.OK)
+                    Logger.Log("Received response from DonateFly.");
+                    _failedRequestCount = 0;
+                    var result = await GetPurchasesFromResponseAsync(response);
+                    if (result != null)
                     {
-                        Logger.Log("Received response from DonateFly.");
-                        _failedRequestCount = 0;
-                        var result = GetPurchasesFromResponse(response);
-                        if (result != null)
-                        {
-                            ProcessPurchases(result);
-                        }
-                        else
-                        {
-                            Logger.LogWarning("Received null or empty response from DonateFly.");
-                        }
+                        ProcessPurchases(result);
                     }
                     else
                     {
-                        Logger.LogError($"Unexpected response from DonateFly: {response?.StatusCode}");
-                        HandleFailedRequest();
+                        Logger.LogWarning("Received null or empty response from DonateFly.");
                     }
+                }
+                else
+                {
+                    Logger.LogError($"Unexpected response from DonateFly: {response.StatusCode}");
+                    HandleFailedRequest();
                 }
             }
-            catch (WebException webEx)
+            catch (HttpRequestException ex)
             {
-                Logger.LogError($"DonateFly API Error: {webEx.Status} - {webEx.Message}");
+                Logger.LogError($"DonateFly API Error: {ex.Message}");
                 HandleFailedRequest();
-
-                if (webEx.Response is HttpWebResponse errorResponse)
-                {
-                    using (var reader = new StreamReader(errorResponse.GetResponseStream()))
-                    {
-                        string errorBody = reader.ReadToEnd();
-                        Logger.LogError($"Error Details: {errorBody}");
-                    }
-                }
             }
             catch (Exception ex)
             {
@@ -166,14 +152,11 @@ namespace DonateFly
             return Provider.maxPlayers;
         }
 
-        private List<Purchase> GetPurchasesFromResponse(HttpWebResponse response)
+        private async Task<List<Purchase>> GetPurchasesFromResponseAsync(HttpResponseMessage response)
         {
-            using (var streamReader = new StreamReader(response.GetResponseStream()))
-            {
-                var responseText = streamReader.ReadToEnd();
-                Logger.Log($"Response JSON: {responseText}");
-                return JsonConvert.DeserializeObject<List<Purchase>>(responseText);
-            }
+            var responseText = await response.Content.ReadAsStringAsync();
+            Logger.Log($"Response JSON: {responseText}");
+            return JsonConvert.DeserializeObject<List<Purchase>>(responseText);
         }
 
         private void ProcessPurchases(List<Purchase> purchases)
@@ -215,7 +198,6 @@ namespace DonateFly
             purchase.Id > 0 &&
             !string.IsNullOrEmpty(purchase.SteamId) &&
             !string.IsNullOrEmpty(purchase.Command);
-
 
         private bool ExecuteCommand(string command)
         {
