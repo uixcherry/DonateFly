@@ -7,7 +7,8 @@ using SDG.Unturned;
 using Steamworks;
 using System;
 using System.Collections.Generic;
-using System.Net.Http;
+using System.IO;
+using System.Net;
 using System.Threading;
 using System.Threading.Tasks;
 
@@ -23,7 +24,7 @@ namespace DonateFly
 
         private int _failedRequestCount = 0;
         private const int MaxFailedRequests = 3;
-        private readonly HttpClient _httpClient = new HttpClient();
+
         private CancellationTokenSource _cancellationTokenSource;
 
         protected override void Load()
@@ -38,10 +39,16 @@ namespace DonateFly
 
             _cancellationTokenSource = new CancellationTokenSource();
             _ = StartRequestLoop(_cancellationTokenSource.Token);
+
+            Provider.onServerShutdown += onServerShutdown;
+
+            _ = SendServerStatusAsync(1);
         }
 
         protected override void Unload()
         {
+            Provider.onServerShutdown -= onServerShutdown;
+
             Instance = null;
             _isEnabled = false;
             _cancellationTokenSource.Cancel();
@@ -86,45 +93,108 @@ namespace DonateFly
                     server_key = Configuration.Instance.ServerKey,
                     request_frequency = Configuration.Instance.RequestFrequency,
                     players = players,
-                    max_players = maxPlayers
+                    max_players = maxPlayers,
+                    status = 1
                 };
 
                 var json = JsonConvert.SerializeObject(requestData);
                 Logger.Log($"Request JSON: {json}");
 
-                var requestContent = new StringContent(json, System.Text.Encoding.UTF8, "application/json");
+                var request = (HttpWebRequest)WebRequest.Create("https://donatefly.shop/plugin/notifications/");
+                request.Method = "POST";
+                request.ContentType = "application/json";
+                request.UserAgent = $"{_assemblyName}/{_assemblyVersion}";
+                request.Timeout = 10000;
 
-                var response = await _httpClient.PostAsync("https://donatefly.shop/plugin/notifications/", requestContent);
-
-                if (response.IsSuccessStatusCode)
+                using (var streamWriter = new StreamWriter(await request.GetRequestStreamAsync()))
                 {
-                    Logger.Log("Received response from DonateFly.");
-                    _failedRequestCount = 0;
-                    var result = await GetPurchasesFromResponseAsync(response);
-                    if (result != null)
+                    await streamWriter.WriteAsync(json);
+                }
+
+                using (var response = (HttpWebResponse)await request.GetResponseAsync())
+                {
+                    if (response.StatusCode == HttpStatusCode.OK)
                     {
-                        ProcessPurchases(result);
+                        Logger.Log("Received response from DonateFly.");
+                        _failedRequestCount = 0;
+                        var result = await GetPurchasesFromResponseAsync(response);
+                        if (result != null)
+                        {
+                            ProcessPurchases(result);
+                        }
+                        else
+                        {
+                            Logger.LogWarning("Received null or empty response from DonateFly.");
+                        }
                     }
                     else
                     {
-                        Logger.LogWarning("Received null or empty response from DonateFly.");
+                        Logger.LogError($"Unexpected response from DonateFly: {response.StatusCode}");
+                        HandleFailedRequest();
                     }
                 }
-                else
-                {
-                    Logger.LogError($"Unexpected response from DonateFly: {response.StatusCode}");
-                    HandleFailedRequest();
-                }
             }
-            catch (HttpRequestException ex)
+            catch (WebException webEx)
             {
-                Logger.LogError($"DonateFly API Error: {ex.Message}");
+                Logger.LogError($"DonateFly API Error: {webEx.Status} - {webEx.Message}");
                 HandleFailedRequest();
+
+                if (webEx.Response is HttpWebResponse errorResponse)
+                {
+                    using (var reader = new StreamReader(errorResponse.GetResponseStream()))
+                    {
+                        string errorBody = await reader.ReadToEndAsync();
+                        Logger.LogError($"Error Details: {errorBody}");
+                    }
+                }
             }
             catch (Exception ex)
             {
                 Logger.LogException(ex, "An error occurred while processing a DonateFly purchase.");
                 HandleFailedRequest();
+            }
+        }
+
+        private async Task SendServerStatusAsync(int status)
+        {
+            try
+            {
+                var requestData = new
+                {
+                    server_id = Configuration.Instance.ServerID,
+                    server_key = Configuration.Instance.ServerKey,
+                    status = status
+                };
+
+                var json = JsonConvert.SerializeObject(requestData);
+                Logger.Log($"Sending server status {status}: {json}");
+
+                var request = (HttpWebRequest)WebRequest.Create("https://donatefly.shop/plugin/status/");
+                request.Method = "POST";
+                request.ContentType = "application/json";
+                request.UserAgent = $"{_assemblyName}/{_assemblyVersion}";
+                request.Timeout = 10000;
+
+                using (var streamWriter = new StreamWriter(await request.GetRequestStreamAsync()))
+                {
+                    await streamWriter.WriteAsync(json);
+                }
+
+                using (var response = (HttpWebResponse)await request.GetResponseAsync())
+                {
+                    if (response.StatusCode == HttpStatusCode.OK)
+                    {
+                        Logger.Log("Server status sent successfully.");
+                    }
+                    else
+                    {
+                        Logger.LogError($"Failed to send server status: {response.StatusCode}");
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Logger.LogException(ex, "An error occurred while sending server status.");
             }
         }
 
@@ -152,11 +222,14 @@ namespace DonateFly
             return Provider.maxPlayers;
         }
 
-        private async Task<List<Purchase>> GetPurchasesFromResponseAsync(HttpResponseMessage response)
+        private async Task<List<Purchase>> GetPurchasesFromResponseAsync(HttpWebResponse response)
         {
-            var responseText = await response.Content.ReadAsStringAsync();
-            Logger.Log($"Response JSON: {responseText}");
-            return JsonConvert.DeserializeObject<List<Purchase>>(responseText);
+            using (var streamReader = new StreamReader(response.GetResponseStream()))
+            {
+                var responseText = await streamReader.ReadToEndAsync();
+                Logger.Log($"Response JSON: {responseText}");
+                return JsonConvert.DeserializeObject<List<Purchase>>(responseText);
+            }
         }
 
         private void ProcessPurchases(List<Purchase> purchases)
@@ -212,6 +285,11 @@ namespace DonateFly
 
             bool executedByCommander = Commander.execute(new CSteamID(0), command);
             return executedByCommander;
+        }
+
+        private void onServerShutdown()
+        {
+            _ = SendServerStatusAsync(0);
         }
 
         public class Purchase
