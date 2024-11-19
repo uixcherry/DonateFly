@@ -25,6 +25,7 @@ namespace DonateFly
         private int _failedRequestCount = 0;
         private const int MaxFailedRequests = 3;
 
+        private readonly object _lock = new object();
         private CancellationTokenSource _cancellationTokenSource;
 
         protected override void Load()
@@ -70,12 +71,30 @@ namespace DonateFly
             {
                 try
                 {
-                    await Task.Delay(Configuration.Instance.RequestFrequency * 60 * 1000, cancellationToken);
-                    if (_isEnabled) await SendRequestAsync();
+                    if (cancellationToken.IsCancellationRequested)
+                    {
+                        Logger.Log("Cancellation requested, stopping the request loop.");
+                        break;
+                    }
+
+                    await Task.Delay(Configuration.Instance.RequestFrequency * 60 * 1000, cancellationToken).ConfigureAwait(false);
+
+                    if (_isEnabled)
+                    {
+                        bool success = await RetryHttpRequest(async () => await SendRequestAsync(), 3).ConfigureAwait(false);
+                        if (!success)
+                        {
+                            Logger.LogError("Request loop encountered persistent errors and stopped attempts.");
+                        }
+                    }
                 }
                 catch (TaskCanceledException)
                 {
                     Logger.Log("Request loop canceled.");
+                }
+                catch (Exception ex)
+                {
+                    Logger.LogException(ex, "Unexpected error occurred in the request loop.");
                 }
             }
         }
@@ -84,40 +103,44 @@ namespace DonateFly
         {
             try
             {
-                var players = GetOnlinePlayers();
-                var maxPlayers = GetMaxPlayers();
+                List<string> players = GetOnlinePlayers();
+                int maxPlayers = GetMaxPlayers();
 
-                var requestData = new
+                Dictionary<string, object> requestData = new Dictionary<string, object>
                 {
-                    server_id = Configuration.Instance.ServerID,
-                    server_key = Configuration.Instance.ServerKey,
-                    request_frequency = Configuration.Instance.RequestFrequency,
-                    players = players,
-                    max_players = maxPlayers,
-                    status = 1
+                    { "server_id", Configuration.Instance.ServerID },
+                    { "server_key", Configuration.Instance.ServerKey },
+                    { "request_frequency", Configuration.Instance.RequestFrequency },
+                    { "players", players },
+                    { "max_players", maxPlayers },
+                    { "status", 1 }
                 };
 
-                var json = JsonConvert.SerializeObject(requestData);
+                string json = JsonConvert.SerializeObject(requestData);
                 Logger.Log($"Request JSON: {json}");
 
-                var request = (HttpWebRequest)WebRequest.Create("https://donatefly.shop/plugin/notifications/");
+                HttpWebRequest request = (HttpWebRequest)WebRequest.Create("https://donatefly.shop/plugin/notifications/");
                 request.Method = "POST";
                 request.ContentType = "application/json";
                 request.UserAgent = $"{_assemblyName}/{_assemblyVersion}";
                 request.Timeout = 10000;
 
-                using (var streamWriter = new StreamWriter(await request.GetRequestStreamAsync()))
+                using (StreamWriter streamWriter = new StreamWriter(await request.GetRequestStreamAsync().ConfigureAwait(false)))
                 {
-                    await streamWriter.WriteAsync(json);
+                    await streamWriter.WriteAsync(json).ConfigureAwait(false);
                 }
 
-                using (var response = (HttpWebResponse)await request.GetResponseAsync())
+                using (HttpWebResponse response = (HttpWebResponse)await request.GetResponseAsync().ConfigureAwait(false))
                 {
                     if (response.StatusCode == HttpStatusCode.OK)
                     {
                         Logger.Log("Received response from DonateFly.");
-                        _failedRequestCount = 0;
-                        var result = await GetPurchasesFromResponseAsync(response);
+                        lock (_lock)
+                        {
+                            _failedRequestCount = 0;
+                        }
+
+                        List<Purchase> result = await GetPurchasesFromResponseAsync(response).ConfigureAwait(false);
                         if (result != null)
                         {
                             ProcessPurchases(result);
@@ -141,16 +164,16 @@ namespace DonateFly
 
                 if (webEx.Response is HttpWebResponse errorResponse)
                 {
-                    using (var reader = new StreamReader(errorResponse.GetResponseStream()))
+                    using (StreamReader reader = new StreamReader(errorResponse.GetResponseStream()))
                     {
-                        string errorBody = await reader.ReadToEndAsync();
+                        string errorBody = await reader.ReadToEndAsync().ConfigureAwait(false);
                         Logger.LogError($"Error Details: {errorBody}");
                     }
                 }
             }
             catch (Exception ex)
             {
-                Logger.LogException(ex, "An error occurred while processing a DonateFly purchase.");
+                Logger.LogException(ex, "An error occurred while processing a DonateFly request.");
                 HandleFailedRequest();
             }
         }
@@ -159,28 +182,28 @@ namespace DonateFly
         {
             try
             {
-                var requestData = new
+                Dictionary<string, object> requestData = new Dictionary<string, object>
                 {
-                    server_id = Configuration.Instance.ServerID,
-                    server_key = Configuration.Instance.ServerKey,
-                    status = status
+                    { "server_id", Configuration.Instance.ServerID },
+                    { "server_key", Configuration.Instance.ServerKey },
+                    { "status", status }
                 };
 
-                var json = JsonConvert.SerializeObject(requestData);
-                Logger.Log($"Sending server status {status}: {json}");
+                string json = JsonConvert.SerializeObject(requestData);
+                Logger.Log($"[{DateTime.UtcNow}] Sending server status {status}: {json}");
 
-                var request = (HttpWebRequest)WebRequest.Create("https://donatefly.shop/plugin/status/");
+                HttpWebRequest request = (HttpWebRequest)WebRequest.Create("https://donatefly.shop/plugin/status/");
                 request.Method = "POST";
                 request.ContentType = "application/json";
                 request.UserAgent = $"{_assemblyName}/{_assemblyVersion}";
                 request.Timeout = 10000;
 
-                using (var streamWriter = new StreamWriter(await request.GetRequestStreamAsync()))
+                using (StreamWriter streamWriter = new StreamWriter(await request.GetRequestStreamAsync().ConfigureAwait(false)))
                 {
-                    await streamWriter.WriteAsync(json);
+                    await streamWriter.WriteAsync(json).ConfigureAwait(false);
                 }
 
-                using (var response = (HttpWebResponse)await request.GetResponseAsync())
+                using (HttpWebResponse response = (HttpWebResponse)await request.GetResponseAsync().ConfigureAwait(false))
                 {
                     if (response.StatusCode == HttpStatusCode.OK)
                     {
@@ -200,17 +223,20 @@ namespace DonateFly
 
         private void HandleFailedRequest()
         {
-            _failedRequestCount++;
-            if (_failedRequestCount >= MaxFailedRequests)
+            lock (_lock)
             {
-                Logger.LogError("Server is considered stopped due to multiple failed requests.");
+                _failedRequestCount++;
+                if (_failedRequestCount >= MaxFailedRequests)
+                {
+                    Logger.LogError("Server is considered stopped due to multiple failed requests.");
+                }
             }
         }
 
         private List<string> GetOnlinePlayers()
         {
             List<string> playerList = new List<string>();
-            foreach (var player in Provider.clients)
+            foreach (SteamPlayer player in Provider.clients)
             {
                 playerList.Add(player.playerID.steamID.ToString());
             }
@@ -224,9 +250,9 @@ namespace DonateFly
 
         private async Task<List<Purchase>> GetPurchasesFromResponseAsync(HttpWebResponse response)
         {
-            using (var streamReader = new StreamReader(response.GetResponseStream()))
+            using (StreamReader streamReader = new StreamReader(response.GetResponseStream()))
             {
-                var responseText = await streamReader.ReadToEndAsync();
+                string responseText = await streamReader.ReadToEndAsync().ConfigureAwait(false);
                 Logger.Log($"Response JSON: {responseText}");
                 return JsonConvert.DeserializeObject<List<Purchase>>(responseText);
             }
@@ -234,7 +260,7 @@ namespace DonateFly
 
         private void ProcessPurchases(List<Purchase> purchases)
         {
-            foreach (var purchase in purchases)
+            foreach (Purchase purchase in purchases)
             {
                 if (!IsValidPurchase(purchase))
                 {
@@ -244,7 +270,7 @@ namespace DonateFly
 
                 try
                 {
-                    var steamId = new CSteamID(ulong.Parse(purchase.SteamId));
+                    CSteamID steamId = new CSteamID(ulong.Parse(purchase.SteamId));
                     Logger.Log($"Processing purchase {purchase.Id} for SteamID {steamId}: Command - {purchase.Command}");
 
                     string formattedCommand = string.Format(purchase.Command, steamId);
@@ -281,10 +307,30 @@ namespace DonateFly
             }
 
             bool executedByRocket = R.Commands.Execute(new ConsolePlayer(), command);
-            if (executedByRocket) return true;
+            return executedByRocket;
+        }
 
-            bool executedByCommander = Commander.execute(new CSteamID(0), command);
-            return executedByCommander;
+        private async Task<bool> RetryHttpRequest(Func<Task> action, int maxRetries = 3)
+        {
+            for (int attempt = 1; attempt <= maxRetries; attempt++)
+            {
+                try
+                {
+                    await action().ConfigureAwait(false);
+                    return true;
+                }
+                catch (WebException)
+                {
+                    if (attempt == maxRetries)
+                    {
+                        Logger.LogError("Max retry attempts reached, aborting request.");
+                        return false;
+                    }
+                    Logger.LogWarning($"Retry attempt {attempt} failed, retrying...");
+                    await Task.Delay(TimeSpan.FromSeconds(2 * attempt)).ConfigureAwait(false);
+                }
+            }
+            return false;
         }
 
         private void onServerShutdown()
@@ -292,6 +338,9 @@ namespace DonateFly
             _ = SendServerStatusAsync(0);
         }
 
+        /// <summary>
+        /// Represents a purchase data structure.
+        /// </summary>
         public class Purchase
         {
             public int Id { get; set; }
