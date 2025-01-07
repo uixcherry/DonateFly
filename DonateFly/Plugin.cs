@@ -31,7 +31,7 @@ namespace DonateFly
             Instance = this;
             _isEnabled = true;
             _userAgent = $"{GetType().Assembly.GetName().Name}/{GetType().Assembly.GetName().Version}";
-            Logger.Log($"DonateFly загружен. Версия: {_userAgent}");
+            Logger.Log($"DonateFly loaded. Version: {_userAgent}");
 
             ValidateConfiguration();
             InitializeRequestLoop();
@@ -47,7 +47,7 @@ namespace DonateFly
             _cancellationTokenSource?.Cancel();
             _cancellationTokenSource?.Dispose();
             Instance = null;
-            Logger.Log("DonateFly выгружен.");
+            Logger.Log("DonateFly unloaded.");
         }
 
         private void InitializeRequestLoop()
@@ -60,7 +60,7 @@ namespace DonateFly
         {
             if (Configuration.Instance.RequestFrequency < 5)
             {
-                Logger.LogWarning("Частота запросов слишком низкая. Установлено минимальное значение (5 минут).");
+                Logger.LogWarning("Request frequency is too low. Setting to minimum value (5 minutes).");
                 Configuration.Instance.RequestFrequency = 5;
                 Configuration.Save();
             }
@@ -81,7 +81,7 @@ namespace DonateFly
                 }
                 catch (Exception ex)
                 {
-                    Logger.LogError($"Ошибка в цикле запросов: {ex.Message}");
+                    Logger.LogError($"Error in request loop: {ex.Message}");
                     await Task.Delay(RETRY_DELAY_MS, token).ConfigureAwait(false);
                 }
             }
@@ -99,12 +99,12 @@ namespace DonateFly
                 }
                 catch (WebException ex)
                 {
-                    Logger.LogError($"Попытка {attempt}/3: Ошибка сети: {ex.Status} - {ex.Message}");
+                    Logger.LogError($"Attempt {attempt}/3: Network error: {ex.Status} - {ex.Message}");
                     if (attempt < 3) await Task.Delay(RETRY_DELAY_MS * attempt).ConfigureAwait(false);
                 }
                 catch (Exception ex)
                 {
-                    Logger.LogError($"Критическая ошибка при отправке запроса: {ex.Message}");
+                    Logger.LogError($"Critical error while sending request: {ex.Message}");
                     IncrementFailedRequestCount();
                     break;
                 }
@@ -135,19 +135,19 @@ namespace DonateFly
                         List<Purchase> purchases = await ParseResponseAsync<List<Purchase>>(response).ConfigureAwait(false);
                         if (purchases?.Count > 0)
                         {
-                            Logger.Log($"Получено {purchases.Count} новых покупок.");
+                            Logger.Log($"Received {purchases.Count} new purchases.");
                             ProcessPurchases(purchases);
                         }
                     }
                     else
                     {
-                        Logger.LogError($"Неожиданный ответ от сервера: {response.StatusCode}");
+                        Logger.LogError($"Unexpected server response: {response.StatusCode}");
                     }
                 }
             }
             catch (Exception ex)
             {
-                Logger.LogError($"Ошибка при обработке ответа: {ex.Message}");
+                Logger.LogError($"Error processing response: {ex.Message}");
                 throw;
             }
         }
@@ -170,17 +170,17 @@ namespace DonateFly
                 {
                     if (response.StatusCode != HttpStatusCode.OK)
                     {
-                        Logger.LogError($"Ошибка при отправке статуса сервера: {response.StatusCode}");
+                        Logger.LogError($"Error sending server status: {response.StatusCode}");
                     }
                 }
             }
             catch (WebException ex)
             {
-                Logger.LogError($"Ошибка сети при отправке статуса: {ex.Status} - {ex.Message}");
+                Logger.LogError($"Network error while sending status: {ex.Status} - {ex.Message}");
             }
             catch (Exception ex)
             {
-                Logger.LogError($"Критическая ошибка при отправке статуса: {ex.Message}");
+                Logger.LogError($"Critical error while sending status: {ex.Message}");
             }
         }
 
@@ -210,7 +210,7 @@ namespace DonateFly
             }
             catch (Exception ex)
             {
-                Logger.LogError($"Ошибка при отправке JSON данных: {ex.Message}");
+                Logger.LogError($"Error sending JSON data: {ex.Message}");
                 throw;
             }
         }
@@ -227,7 +227,7 @@ namespace DonateFly
             }
             catch (JsonException ex)
             {
-                Logger.LogError($"Ошибка при разборе JSON ответа: {ex.Message}");
+                Logger.LogError($"Error parsing JSON response: {ex.Message}");
                 throw;
             }
         }
@@ -248,7 +248,7 @@ namespace DonateFly
             {
                 if (!IsValidPurchase(purchase))
                 {
-                    Logger.LogWarning($"Получены некорректные данные покупки: {JsonConvert.SerializeObject(purchase)}");
+                    Logger.LogWarning($"Received invalid purchase data: {JsonConvert.SerializeObject(purchase)}");
                     continue;
                 }
 
@@ -256,16 +256,16 @@ namespace DonateFly
                 {
                     CSteamID steamId = new CSteamID(ulong.Parse(purchase.SteamId));
                     string command = string.Format(purchase.Command, steamId);
-                    Logger.Log($"Выполнение команды для покупки {purchase.Id}: {command}");
+                    Logger.Log($"Executing command for purchase {purchase.Id}: {command}");
 
                     if (!ExecuteCommand(command))
                     {
-                        Logger.LogError($"Не удалось выполнить команду для покупки {purchase.Id}");
+                        Logger.LogError($"Failed to execute command for purchase {purchase.Id}");
                     }
                 }
                 catch (Exception ex)
                 {
-                    Logger.LogError($"Ошибка при обработке покупки {purchase.Id}: {ex.Message}");
+                    Logger.LogError($"Error processing purchase {purchase.Id}: {ex.Message}");
                 }
             }
         }
@@ -279,7 +279,7 @@ namespace DonateFly
         {
             if (string.IsNullOrEmpty(command))
             {
-                Logger.LogError("Получена пустая команда.");
+                Logger.LogError("Received empty command.");
                 return false;
             }
             return R.Commands.Execute(new ConsolePlayer(), command);
@@ -292,7 +292,7 @@ namespace DonateFly
                 _failedRequestCount++;
                 if (_failedRequestCount >= 3)
                 {
-                    Logger.LogError($"Достигнуто максимальное количество ошибок ({_failedRequestCount}).");
+                    Logger.LogError($"Reached maximum number of errors ({_failedRequestCount}).");
                 }
             }
         }
@@ -307,7 +307,7 @@ namespace DonateFly
 
         private void OnServerShutdown()
         {
-            Logger.Log("Отправка статуса выключения сервера...");
+            Logger.Log("Sending server shutdown status...");
             Task.Run(async () => await SendServerStatusAsync(0).ConfigureAwait(false)).Wait(1000);
         }
 
