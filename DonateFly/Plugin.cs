@@ -9,6 +9,7 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Net;
+using System.Reflection;
 using System.Threading;
 using System.Threading.Tasks;
 
@@ -19,41 +20,50 @@ namespace DonateFly
         public static Plugin Instance { get; private set; }
         private volatile bool _isEnabled;
         private string _userAgent;
-        private readonly object _syncLock = new object();
+        private readonly SemaphoreSlim _semaphore = new SemaphoreSlim(1, 1);
         private CancellationTokenSource _cancellationTokenSource;
+        private Task _requestLoopTask;
         private const int REQUEST_TIMEOUT = 15000;
-        private const string API_BASE_URL = "https://donatefly.shop/plugin/";
         private const int RETRY_DELAY_MS = 2000;
-        private int _failedRequestCount;
+        private const int MAX_RETRIES = 3;
+        private const string API_URL = "https://donatefly.shop/plugin";
 
-        protected override void Load()
+        protected override async void Load()
         {
             Instance = this;
             _isEnabled = true;
-            _userAgent = $"{GetType().Assembly.GetName().Name}/{GetType().Assembly.GetName().Version}";
-            Logger.Log($"DonateFly loaded. Version: {_userAgent}");
+            _userAgent = $"{Assembly.GetExecutingAssembly().GetName().Name}/{Assembly.GetExecutingAssembly().GetName().Version}";
 
             ValidateConfiguration();
-            InitializeRequestLoop();
+
+            _cancellationTokenSource = new CancellationTokenSource();
             Provider.onServerShutdown += OnServerShutdown;
 
-            Task.Run(async () => await SendServerStatusAsync(1).ConfigureAwait(false));
+            _requestLoopTask = StartRequestLoop(_cancellationTokenSource.Token);
+            await SendServerStatusAsync(1).ConfigureAwait(false);
+
+            Logger.Log($"DonateFly loaded. Version: {Assembly.GetExecutingAssembly().GetName().Version}");
         }
 
-        protected override void Unload()
+        protected override async void Unload()
         {
             _isEnabled = false;
             Provider.onServerShutdown -= OnServerShutdown;
-            _cancellationTokenSource?.Cancel();
-            _cancellationTokenSource?.Dispose();
-            Instance = null;
-            Logger.Log("DonateFly unloaded.");
-        }
 
-        private void InitializeRequestLoop()
-        {
-            _cancellationTokenSource = new CancellationTokenSource();
-            Task.Run(async () => await StartRequestLoop(_cancellationTokenSource.Token).ConfigureAwait(false));
+            _cancellationTokenSource?.Cancel();
+
+            try
+            {
+                if (_requestLoopTask != null)
+                    await _requestLoopTask.ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) { }
+
+            _cancellationTokenSource?.Dispose();
+            _semaphore?.Dispose();
+            Instance = null;
+
+            Logger.Log("DonateFly unloaded.");
         }
 
         private void ValidateConfiguration()
@@ -72,8 +82,9 @@ namespace DonateFly
             {
                 try
                 {
-                    await Task.Delay(Configuration.Instance.RequestFrequency * 60 * 1000, token).ConfigureAwait(false);
-                    if (_isEnabled) await ProcessRequestWithRetry().ConfigureAwait(false);
+                    await Task.Delay(Configuration.Instance.RequestFrequency * 60 * 1000, token);
+                    if (_isEnabled)
+                        await ProcessRequestWithRetry().ConfigureAwait(false);
                 }
                 catch (OperationCanceledException)
                 {
@@ -82,30 +93,29 @@ namespace DonateFly
                 catch (Exception ex)
                 {
                     Logger.LogError($"Error in request loop: {ex.Message}");
-                    await Task.Delay(RETRY_DELAY_MS, token).ConfigureAwait(false);
+                    await Task.Delay(RETRY_DELAY_MS, token);
                 }
             }
         }
 
         private async Task ProcessRequestWithRetry()
         {
-            for (int attempt = 1; attempt <= 3; attempt++)
+            for (int attempt = 1; attempt <= MAX_RETRIES; attempt++)
             {
                 try
                 {
                     await SendRequestAsync().ConfigureAwait(false);
-                    ResetFailedRequestCount();
                     return;
                 }
                 catch (WebException ex)
                 {
-                    Logger.LogError($"Attempt {attempt}/3: Network error: {ex.Status} - {ex.Message}");
-                    if (attempt < 3) await Task.Delay(RETRY_DELAY_MS * attempt).ConfigureAwait(false);
+                    Logger.LogError($"Attempt {attempt}/{MAX_RETRIES}: Network error: {ex.Status} - {ex.Message}");
+                    if (attempt < MAX_RETRIES)
+                        await Task.Delay(RETRY_DELAY_MS * attempt);
                 }
                 catch (Exception ex)
                 {
                     Logger.LogError($"Critical error while sending request: {ex.Message}");
-                    IncrementFailedRequestCount();
                     break;
                 }
             }
@@ -113,21 +123,26 @@ namespace DonateFly
 
         private async Task SendRequestAsync()
         {
-            Dictionary<string, object> requestData = new Dictionary<string, object>
-            {
-                { "server_id", Configuration.Instance.ServerID },
-                { "server_key", Configuration.Instance.ServerKey },
-                { "request_frequency", Configuration.Instance.RequestFrequency },
-                { "players", GetOnlinePlayers() },
-                { "max_players", Provider.maxPlayers },
-                { "status", 1 }
-            };
-
-            HttpWebRequest request = CreateWebRequest($"{API_BASE_URL}notifications/");
-            await SendJsonRequest(request, requestData).ConfigureAwait(false);
-
+            await _semaphore.WaitAsync();
             try
             {
+                Dictionary<string, object> requestData = new Dictionary<string, object>
+               {
+                   { "server_id", Configuration.Instance.ServerID },
+                   { "server_key", Configuration.Instance.ServerKey },
+                   { "request_frequency", Configuration.Instance.RequestFrequency },
+                   { "players", GetOnlinePlayers() },
+                   { "max_players", Provider.maxPlayers },
+                   { "status", 1 }
+               };
+
+                string fullUrl = $"{API_URL}/notifications/";
+                Logger.Log($"Sending request to: {fullUrl}");
+                Logger.Log($"Request data: {JsonConvert.SerializeObject(requestData)}");
+
+                HttpWebRequest request = CreateWebRequest(fullUrl);
+                await SendJsonRequest(request, requestData).ConfigureAwait(false);
+
                 using (HttpWebResponse response = (HttpWebResponse)await request.GetResponseAsync().ConfigureAwait(false))
                 {
                     if (response.StatusCode == HttpStatusCode.OK)
@@ -145,15 +160,15 @@ namespace DonateFly
                     }
                 }
             }
-            catch (Exception ex)
+            finally
             {
-                Logger.LogError($"Error processing response: {ex.Message}");
-                throw;
+                _semaphore.Release();
             }
         }
 
         private async Task SendServerStatusAsync(int status)
         {
+            await _semaphore.WaitAsync();
             try
             {
                 Dictionary<string, object> requestData = new Dictionary<string, object>
@@ -163,35 +178,63 @@ namespace DonateFly
                     { "status", status }
                 };
 
-                HttpWebRequest request = CreateWebRequest($"{API_BASE_URL}status/");
-                await SendJsonRequest(request, requestData).ConfigureAwait(false);
-
-                using (HttpWebResponse response = (HttpWebResponse)await request.GetResponseAsync().ConfigureAwait(false))
+                string fullUrl = $"{Configuration.Instance.ApiUrl}/status/";
+                using (HttpWebResponse response = await SendHttpRequestAsync(fullUrl, requestData).ConfigureAwait(false))
                 {
                     if (response.StatusCode != HttpStatusCode.OK)
                     {
-                        Logger.LogError($"Error sending server status: {response.StatusCode}");
+                        Logger.LogError($"Error sending server status. Server returned: {response.StatusCode} - {response.StatusDescription}");
                     }
                 }
             }
             catch (WebException ex)
             {
-                Logger.LogError($"Network error while sending status: {ex.Status} - {ex.Message}");
+                string errorDetails = await GetWebExceptionDetailsAsync(ex);
+                Logger.LogError($"Error sending server status: {ex.Status} - {errorDetails}");
             }
             catch (Exception ex)
             {
-                Logger.LogError($"Critical error while sending status: {ex.Message}");
+                Logger.LogError($"Critical error sending server status: {ex.GetType().Name} - {ex.Message}");
+                if (ex.InnerException != null)
+                {
+                    Logger.LogError($"Inner error: {ex.InnerException.Message}");
+                }
             }
+            finally
+            {
+                _semaphore.Release();
+            }
+        }
+
+        private async Task<string> GetWebExceptionDetailsAsync(WebException ex)
+        {
+            if (ex.Response == null)
+                return ex.Message;
+
+            using (HttpWebResponse errorResponse = (HttpWebResponse)ex.Response)
+            using (Stream stream = errorResponse.GetResponseStream())
+            using (StreamReader reader = new StreamReader(stream))
+            {
+                string errorContent = await reader.ReadToEndAsync();
+                return $"Status: {errorResponse.StatusCode}, Content: {errorContent}";
+            }
+        }
+
+        private async Task<HttpWebResponse> SendHttpRequestAsync(string url, object data)
+        {
+            HttpWebRequest request = CreateWebRequest(url);
+            await SendJsonRequest(request, data).ConfigureAwait(false);
+            return (HttpWebResponse)await request.GetResponseAsync().ConfigureAwait(false);
         }
 
         private HttpWebRequest CreateWebRequest(string url)
         {
+            ServicePointManager.ServerCertificateValidationCallback = delegate { return true; };
             HttpWebRequest request = (HttpWebRequest)WebRequest.Create(url);
             request.Method = "POST";
             request.ContentType = "application/json";
             request.UserAgent = _userAgent;
             request.Timeout = REQUEST_TIMEOUT;
-            ServicePointManager.ServerCertificateValidationCallback = delegate { return true; };
             return request;
         }
 
@@ -201,34 +244,18 @@ namespace DonateFly
             byte[] bytes = System.Text.Encoding.UTF8.GetBytes(json);
             request.ContentLength = bytes.Length;
 
-            try
+            using (Stream stream = await request.GetRequestStreamAsync().ConfigureAwait(false))
             {
-                using (Stream stream = await request.GetRequestStreamAsync().ConfigureAwait(false))
-                {
-                    await stream.WriteAsync(bytes, 0, bytes.Length).ConfigureAwait(false);
-                }
-            }
-            catch (Exception ex)
-            {
-                Logger.LogError($"Error sending JSON data: {ex.Message}");
-                throw;
+                await stream.WriteAsync(bytes, 0, bytes.Length).ConfigureAwait(false);
             }
         }
 
         private async Task<T> ParseResponseAsync<T>(HttpWebResponse response)
         {
-            try
+            using (StreamReader reader = new StreamReader(response.GetResponseStream()))
             {
-                using (StreamReader reader = new StreamReader(response.GetResponseStream()))
-                {
-                    string json = await reader.ReadToEndAsync().ConfigureAwait(false);
-                    return JsonConvert.DeserializeObject<T>(json);
-                }
-            }
-            catch (JsonException ex)
-            {
-                Logger.LogError($"Error parsing JSON response: {ex.Message}");
-                throw;
+                string json = await reader.ReadToEndAsync().ConfigureAwait(false);
+                return JsonConvert.DeserializeObject<T>(json);
             }
         }
 
@@ -270,10 +297,13 @@ namespace DonateFly
             }
         }
 
-        private bool IsValidPurchase(Purchase purchase) =>
-            purchase != null && purchase.Id > 0 &&
-            !string.IsNullOrEmpty(purchase.SteamId) &&
-            !string.IsNullOrEmpty(purchase.Command);
+        private bool IsValidPurchase(Purchase purchase)
+        {
+            return purchase != null &&
+                   purchase.Id > 0 &&
+                   !string.IsNullOrEmpty(purchase.SteamId) &&
+                   !string.IsNullOrEmpty(purchase.Command);
+        }
 
         private bool ExecuteCommand(string command)
         {
@@ -285,29 +315,8 @@ namespace DonateFly
             return R.Commands.Execute(new ConsolePlayer(), command);
         }
 
-        private void IncrementFailedRequestCount()
-        {
-            lock (_syncLock)
-            {
-                _failedRequestCount++;
-                if (_failedRequestCount >= 3)
-                {
-                    Logger.LogError($"Reached maximum number of errors ({_failedRequestCount}).");
-                }
-            }
-        }
-
-        private void ResetFailedRequestCount()
-        {
-            lock (_syncLock)
-            {
-                _failedRequestCount = 0;
-            }
-        }
-
         private void OnServerShutdown()
         {
-            Logger.Log("Sending server shutdown status...");
             Task.Run(async () => await SendServerStatusAsync(0).ConfigureAwait(false)).Wait(1000);
         }
 
