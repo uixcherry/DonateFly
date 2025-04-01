@@ -70,9 +70,14 @@
     </Reference>
   </ItemGroup>
   <ItemGroup>
+    <Compile Include="Commands\DonateCommand.cs" />
     <Compile Include="Configuration.cs" />
+    <Compile Include="Data\CachedItems.cs" />
+    <Compile Include="Data\ItemRedeemResult.cs" />
+    <Compile Include="Data\PlayerItem.cs" />
     <Compile Include="Plugin.cs" />
     <Compile Include="Properties\AssemblyInfo.cs" />
   </ItemGroup>
+  <ItemGroup />
   <Import Project="$(MSBuildToolsPath)\Microsoft.CSharp.targets" />
 </Project>
